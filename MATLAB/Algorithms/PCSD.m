@@ -46,6 +46,7 @@ function [ f,qualMeasOut] = PCSD(proj,geo,angles,maxiter,varargin)
 
 measurequality=~isempty(QualMeasOpts);
 
+
 % does detector rotation exists?
 if ~isfield(geo,'rotDetector')
     geo.rotDetector=[0;0;0];
@@ -65,17 +66,10 @@ geoaux.dVoxel=geoaux.sVoxel./geoaux.nVoxel;
 W=Ax(ones(geoaux.nVoxel','single'),geoaux,angles,'ray-voxel');
 W(W<min(geo.dVoxel)/4)=Inf;
 W=1./W;
-if ~isfield(geo,'mode')||~strcmp(geo.mode,'parallel')
-    
-    [x,y]=meshgrid(geo.sVoxel(1)/2-geo.dVoxel(1)/2+geo.offOrigin(1):-geo.dVoxel(1):-geo.sVoxel(1)/2+geo.dVoxel(1)/2+geo.offOrigin(1),...
-        -geo.sVoxel(2)/2+geo.dVoxel(2)/2+geo.offOrigin(2): geo.dVoxel(2): geo.sVoxel(2)/2-geo.dVoxel(2)/2+geo.offOrigin(2));
-    A = permute(angles(1,:)+pi/2, [1 3 2]);
-    V = (geo.DSO ./ (geo.DSO + bsxfun(@times, y, sin(-A)) - bsxfun(@times, x, cos(-A)))).^2;
-    V=permute(single(V),[2 1 3]);
-else
-    V=ones([geo.nVoxel(1:2).',size(angles,2)],'single');
-end
-clear A x y dx dz;
+
+% Compute V
+V=computeV(geo,angles,num2cell(angles,1));
+
 
 %Initialize image.
 f=zeros(geo.nVoxel','single');
@@ -87,6 +81,7 @@ rotDetector=geo.rotDetector;
 stop_criteria=0;
 DSD=geo.DSD;
 DSO=geo.DSO;
+%%
 while ~stop_criteria %POCS
     f0=f;
     if (iter==0 && verbose==1);tic;end
@@ -132,7 +127,7 @@ while ~stop_criteria %POCS
     end
     
     % Compute L2 error of actual image. Ax-b
-    dd=im3Dnorm(Ax(f,geo,angles);-proj,'L2');
+    dd=im3Dnorm(Ax(f,geo,angles)-proj,'L2');
     % Compute change in the image after last SART iteration
     dp_vec=(f-f0);
     
