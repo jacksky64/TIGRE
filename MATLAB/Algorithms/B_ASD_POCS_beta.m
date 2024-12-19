@@ -1,11 +1,11 @@
-function [ fres ] = B_ASD_POCS_beta(proj,geo,angles,maxiter,varargin)
+function [ fres, qualMeasOut ] = B_ASD_POCS_beta(proj,geo,angles,maxiter,varargin)
 
 % B_ASD_POCS_beta Solves the ASD_POCS total variation constrained image in 3D
 % tomography using bregman iteration for the data.
 %
 %   B_ASD_POCS_beta(PROJ,GEO,ALPHA,NITER) solves the reconstruction problem
 %   using the projection data PROJ taken over ALPHA angles, corresponding
-%   to the geometry descrived in GEO, using NITER iterations.
+%   to the geometry described in GEO, using NITER iterations.
 %
 %   B_ASD_POCS_beta(PROJ,GEO,ALPHA,NITER,OPT,VAL,...) uses options and values for solving. The
 %   possible options in OPT are:
@@ -16,6 +16,11 @@ function [ fres ] = B_ASD_POCS_beta(proj,geo,angles,maxiter,varargin)
 %
 %   'lambdared':   Reduction of lambda.Every  iteration
 %                  lambda=lambdared*lambda. Default is 0.99
+%
+%       'init':    Describes different initialization techniques.
+%                   •  'none'     : Initializes the image to zeros(default)
+
+%                   •  'FDK'      : initializes image to FDK reconstruction
 %
 %   'TViter':      Defines the amount of TV iterations performed per SART
 %                  iteration. Default is 20
@@ -40,14 +45,25 @@ function [ fres ] = B_ASD_POCS_beta(proj,geo,angles,maxiter,varargin)
 %                  how often the bregman iteration is executed. It has to
 %                  be smaller than the number of iterations.
 %
+%   'QualMeas'     Asks the algorithm for a set of quality measurement
+%                  parameters. Input should contain a cell array of desired
+%                  quality measurement names. Example: {'CC','RMSE','MSSIM'}
+%                  These will be computed in each iteration.
+%
 %   'Verbose'      1 or 0. Default is 1. Gives information about the
 %                  progress of the algorithm.
 %
 % 'OrderStrategy'  Chooses the subset ordering strategy. Options are
 %                  'ordered' :uses them in the input order, but divided
-%                  'random'  : orders them randomply
+%                  'random'  : orders them randomly
 %                  'angularDistance': chooses the next subset with the
 %                                     biggest angular distance with the ones used.
+% 'redundancy_weighting': true or false. Default is true. Applies data
+%                         redundancy weighting to projections in the update step
+%                         (relevant for offset detector geometry)
+%  'groundTruth'  an image as ground truth, to be used if quality measures
+%                 are requested, to plot their change w.r.t. this known
+%                 data.
 %--------------------------------------------------------------------------
 %--------------------------------------------------------------------------
 % This file is part of the TIGRE Toolbox
@@ -70,40 +86,56 @@ function [ fres ] = B_ASD_POCS_beta(proj,geo,angles,maxiter,varargin)
 %% parse inputs
 blocksize=1;
 
-[beta,beta_red,ng,verbose,alpha,alpha_red,rmax,epsilon,bregman,bregman_red,bregman_iter,OrderStrategy,nonneg]=parse_inputs(proj,geo,angles,varargin);
+[beta,beta_red,f,ng,verbose,alpha,alpha_red,rmax,epsilon,bregman,bregman_red,bregman_iter,OrderStrategy,nonneg,QualMeasOpts,gpuids,redundancy_weights,gt]=parse_inputs(proj,geo,angles,varargin);
+
 [alphablocks,orig_index]=order_subsets(angles,blocksize,OrderStrategy);
 
 angles_reorder=cell2mat(alphablocks);
 index_angles=cell2mat(orig_index);
+
+measurequality=~isempty(QualMeasOpts) | ~any(isnan(gt(:)));
+if ~any(isnan(gt(:)))
+    QualMeasOpts{end+1}='error_norm';
+    res_prev=gt;
+    clear gt
+end
+if nargout<2 && measurequality
+    warning("Image metrics requested but none catched as output. Call the algorithm with 3 outputs to store them")
+    measurequality=false;
+end
+qualMeasOut=zeros(length(QualMeasOpts),maxiter);
 
 
 % does detector rotation exists?
 if ~isfield(geo,'rotDetector')
     geo.rotDetector=[0;0;0];
 end
-%% Create weigthing matrices for the SART step
-% the reason we do this, instead of calling the SART fucntion is not to
-% recompute the weigths every ASD-POCS iteration, thus effectively doubling
+%% Create weighting matrices for the SART step
+% the reason we do this, instead of calling the SART function is not to
+% recompute the weights every ASD-POCS iteration, thus effectively doubling
 % the computational time
-% Projection weigth, W
+% Projection weight, W
 
-geoaux=geo;
-geoaux.sVoxel([1 2])=geo.sVoxel([1 2])*1.1; % a Bit bigger, to avoid numerical division by zero (small number)
-geoaux.sVoxel(3)=max(geo.sDetector(2),geo.sVoxel(3)); % make sure lines are not cropped. One is for when image is bigger than detector and viceversa
-geoaux.nVoxel=[2,2,2]'; % accurate enough?
-geoaux.dVoxel=geoaux.sVoxel./geoaux.nVoxel;
-W=Ax(ones(geoaux.nVoxel','single'),geoaux,angles,'ray-voxel');  %
-W(W<min(geo.dVoxel)/4)=Inf;
-W=1./W;
+% Projection weight, W
+W=computeW(geo,angles,gpuids);
 
-% Back-Projection weigth, V
-V=computeV(geo,angles,alphablocks,orig_index);
+% Back-Projection weight, V
+V=computeV(geo,angles,alphablocks,orig_index,'gpuids',gpuids);
+if redundancy_weights
+    % Data redundancy weighting, W_r implemented using Wang weighting
+    % reference: https://iopscience.iop.org/article/10.1088/1361-6560/ac16bc
+    
+    num_frames = size(proj,3);
+    W_r = redundancy_weighting(geo);
+    W_r = repmat(W_r,[1,1,num_frames]);
+    % disp('Size of redundancy weighting matrix');
+    % disp(size(W_r));
+    W = W.*W_r; % include redundancy weighting in W
+end
 
 clear A x y dx dz;
 
 
-% initialize image.
-f=zeros(geo.nVoxel','single');
 
 
 stop_criteria=0;
@@ -114,6 +146,10 @@ rotDetector=geo.rotDetector;
 DSD=geo.DSD;
 DSO=geo.DSO;
 while ~stop_criteria %POCS
+    % If quality is going to be measured, then we need to save previous image
+    if measurequality && ~strcmp(QualMeasOpts,'error_norm')
+        res_prev = f; % only store if necessary
+    end
     f0=f;
     if (iter==0 && verbose==1);tic;end
     iter=iter+1;
@@ -136,14 +172,18 @@ while ~stop_criteria %POCS
         %         proj_err=proj(:,:,jj)-Ax(f,geo,angles(:,jj));          %                                 (b-Ax)
         %         weighted_err=W(:,:,jj).*proj_err;                   %                          W^-1 * (b-Ax)
         %         backprj=Atb(weighted_err,geo,angles(:,jj));            %                     At * W^-1 * (b-Ax)
-        %         weigth_backprj=bsxfun(@times,1./V(:,:,jj),backprj); %                 V * At * W^-1 * (b-Ax)
-        %         f=f+beta*weigth_backprj;                          % x= x + lambda * V * At * W^-1 * (b-Ax)
-        f=f+beta* bsxfun(@times,1./V(:,:,jj),Atb(W(:,:,jj).*(proj(:,:,index_angles(:,jj))-Ax(f,geo,angles_reorder(:,jj))),geo,angles_reorder(:,jj)));
+        %         weight_backprj=bsxfun(@times,1./V(:,:,jj),backprj); %                 V * At * W^-1 * (b-Ax)
+        %         f=f+beta*weight_backprj;                          % x= x + lambda * V * At * W^-1 * (b-Ax)
+        f=f+beta* bsxfun(@times,1./V(:,:,jj),Atb(W(:,:,index_angles(:,jj)).*(proj(:,:,index_angles(:,jj))-Ax(f,geo,angles_reorder(:,jj),'gpuids',gpuids)),geo,angles_reorder(:,jj),'gpuids',gpuids));
         
         % Enforce positivity
         if nonneg
             f=max(f,0);
         end
+    end
+    
+    if measurequality
+        qualMeasOut(:,iter)=Measure_Quality(res_prev,f,QualMeasOpts);
     end
     
     geo.offDetector=offDetector;
@@ -153,7 +193,7 @@ while ~stop_criteria %POCS
     % Save copy of image.
     fres=f;
     % compute L2 error of actual image. Ax-b
-    dd=im3Dnorm(Ax(f,geo,angles)-proj,'L2');
+    dd=im3Dnorm(Ax(f,geo,angles,'gpuids',gpuids)-proj,'L2');
     % compute change in the image after last SART iteration
     dp_vec=(f-f0);
     dp=im3Dnorm(dp_vec,'L2');
@@ -166,7 +206,7 @@ while ~stop_criteria %POCS
     %  TV MINIMIZATION
     % =========================================================================
     %  Call GPU to minimize TV
-    f=minimizeTV(f0,dtvg,ng);    %   This is the MATLAB CODE, the functions are sill in the library, but CUDA is used nowadays
+    f=minimizeTV(f0,dtvg,ng,'gpuids',gpuids);    %   This is the MATLAB CODE, the functions are sill in the library, but CUDA is used nowadays
     %                                             for ii=1:ng
     % %                                                 Steepest descend of TV norm
     %                                                 tv(ng*(iter-1)+ii)=im3Dnorm(f,'TV','forward');
@@ -202,7 +242,7 @@ while ~stop_criteria %POCS
     end
     
     if ~mod(iter,bregman_iter)
-        proj=proj+bregman*(proj-Ax(f,geo,angles));
+        proj=proj+bregman*(proj-Ax(f,geo,angles,'gpuids',gpuids));
         bregman=bregman*bregman_red;
         
     end
@@ -211,9 +251,9 @@ while ~stop_criteria %POCS
     
     if (iter==1 && verbose==1)
         expected_time=toc*maxiter;
-        disp('B-ADS-POCS-beta');
-        disp(['Expected duration  :    ',secs2hms(expected_time)]);
-        disp(['Exected finish time:    ',datestr(datetime('now')+seconds(expected_time))]);
+        disp('B_ADS_POCS_beta');
+        disp(['Expected duration   :    ',secs2hms(expected_time)]);
+        disp(['Expected finish time:    ',datestr(datetime('now')+seconds(expected_time))]);
         disp('');
     end
     
@@ -223,9 +263,9 @@ end
 
 end
 
-function [beta,beta_red,ng,verbose,alpha,alpha_red,rmax,epsilon,bregman,bregman_red,bregman_iter,OrderStrategy,nonneg]=parse_inputs(proj,geo,angles,argin)
+function [beta,beta_red,f0,ng,verbose,alpha,alpha_red,rmax,epsilon,bregman,bregman_red,bregman_iter,OrderStrategy,nonneg,QualMeasOpts,gpuids,redundancy_weights,gt]=parse_inputs(proj,geo,angles,argin)
 
-opts=     {'lambda','lambda_red','tviter','verbose','alpha','alpha_red','ratio','maxl2err','beta','beta_red','bregman_iter','orderstrategy','nonneg'};
+opts=     {'lambda','lambda_red','init','tviter','verbose','alpha','alpha_red','ratio','maxl2err','beta','beta_red','bregman_iter','orderstrategy','nonneg','qualmeas','gpuids','redundancy_weighting','groundtruth'};
 defaults=ones(length(opts),1);
 % Check inputs
 nVarargs = length(argin);
@@ -294,6 +334,20 @@ for ii=1:length(opts)
                     error('TIGRE:B_ASD_POCS_beta:InvalidInput','Invalid lambda')
                 end
                 beta_red=val;
+            end
+            % Initial image
+            %  =========================================================================
+        case 'init'
+            if default || strcmp(val,'none')
+                f0=zeros(geo.nVoxel','single');
+                
+            else
+                if strcmp(val,'FDK')
+                    f0=FDK(proj, geo, angles);
+                else
+                    error('TIGRE:B_ASD_POCS_beta:InvalidInput','Invalid init')
+                    
+                end
             end
             % Number of iterations of TV
             %  =========================================================================
@@ -369,6 +423,37 @@ for ii=1:length(opts)
             else
                 nonneg=val;
             end
+            % Image Quality Measure
+            %  =========================================================================
+        case 'qualmeas'
+            if default
+                QualMeasOpts={};
+            else
+                if iscellstr(val)
+                    QualMeasOpts=val;
+                else
+                    error('TIGRE:B_ASD_POCS_beta:InvalidInput','Invalid quality measurement parameters');
+                    
+                end
+            end
+        case 'gpuids'
+            if default
+                gpuids = GpuIds();
+            else
+                gpuids = val;
+            end
+        case 'redundancy_weighting'
+            if default
+                redundancy_weights = true;
+            else
+                redundancy_weights = val;
+            end
+        case 'groundtruth'
+            if default
+                gt=nan;
+            else
+                gt=val;
+            end
         otherwise
             error('TIGRE:B_ASD_POCS_beta:InvalidInput',['Invalid input name:', num2str(opt),'\n No such option']);
             
@@ -376,7 +461,6 @@ for ii=1:length(opts)
 end
 
 end
-
 
 
 

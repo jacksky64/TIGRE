@@ -1,7 +1,7 @@
 %% DEMO 14:  Playing with offsets
 %
 %
-% In this demo we show how to change offsets to either the iamge or the
+% In this demo we show how to change offsets to either the image or the
 % detector, and the flexibility of it.
 % 
 % 
@@ -47,7 +47,7 @@ projections=Ax(head,geo,angles,'interpolated');
 %% lets see it
 plotProj(projections,angles);
 
-%% we will skip recosntruction of this tests because the image is outside the detector
+%% we will skip reconstruction of this tests because the image is outside the detector
 
 
 %% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

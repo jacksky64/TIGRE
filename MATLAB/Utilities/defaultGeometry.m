@@ -1,5 +1,5 @@
 function geo=defaultGeometry(varargin)
-%%geo = defaultGeometry() generates a default geomtry for tests.
+%%geo = defaultGeometry() generates a default geometry for tests.
 % Optional parameters
 %
 % 'mode'      : 'parallel' or 'cone'
@@ -79,7 +79,7 @@ if size(nVoxel,1)==1
     nVoxel=nVoxel.';
 end
 if strcmp(mode,'parallel')&&(all(nVoxel(2:3)~= nDetector))
-    warning('In Parallel mode nVoxel(2:3) is generally equal to nDetector. Consider setting them equal for better recosntruction quality.');
+    warning('In Parallel mode nVoxel(2:3) is generally equal to nDetector. Consider setting them equal for better reconstruction quality.');
 end
 
 end

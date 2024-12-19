@@ -1,6 +1,6 @@
 function [ imgO ] = im3DDenoise( img,type,varargin )
 %IMDENOISE3D removes noise of image with different methods
-%   Currentyl only TV is supported. INput arguments are the iamge, the type
+%   Currently only TV is supported. Input arguments are the image, the type
 %   of denoising ('TV' only now) and the parameters for the denoising,
 %   being number of iterations and hyperparameter currently available. 
 %--------------------------------------------------------------------------
@@ -19,9 +19,14 @@ function [ imgO ] = im3DDenoise( img,type,varargin )
 % Codes:              https://github.com/CERN/TIGRE/
 % Coded by:           Ander Biguri
 %--------------------------------------------------------------------------
-if nargin==4
-   iter=varargin{1};
-   hyper=varargin{2};
+if nargin >= 5
+    [gpuids] = parse_inputs(varargin{3:length(varargin)});
+else
+    gpuids = GpuIds();
+end
+if nargin>=4
+    iter=varargin{1};
+    hyper=varargin{2};
 else
     iter=50;
     hyper=15;
@@ -34,7 +39,17 @@ if strcmp(type,'TV')
     immax=max(img(:));
 
     img=img./(immax+2*eps);
-    imgO=tvDenoise(img,hyper,iter);
+
+    % Generates an error if the data type of img is not single-precision float
+    if ~isa(img, 'single')
+        error('im3DDenoise: Input image of tvDenoise must be single precision');
+    end
+    if ndims(img)==2
+        imgO=tvDenoise(cat(3,img,img),hyper,iter,gpuids.devices);
+        imgO=imgO(:,:,1);
+    else
+        imgO=tvDenoise(img,hyper,iter,gpuids.devices);
+    end
     clear img;
     
     imgO=imgO*immax;
@@ -45,4 +60,21 @@ end
 clear img;
 
 end
+
+function [gpuids]=parse_inputs(varargin)
+    %fprintf('parse_inputs0(varargin (%d))\n', length(varargin));
+    if isempty(varargin)
+        gpuids = GpuIds();
+    else
+        % create input parser
+        p=inputParser;
+        % add optional parameters
+        addParameter(p,'gpuids', GpuIds());
+        %execute
+        parse(p,varargin{:});
+        %extract
+        gpuids=p.Results.gpuids;
+    end
+end
+
 

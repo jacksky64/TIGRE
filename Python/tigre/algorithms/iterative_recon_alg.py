@@ -1,17 +1,20 @@
 from __future__ import division
 
-import numpy as np
-from tigre.utilities.Ax import Ax
-from tigre.utilities.Atb import Atb
-from tigre.utilities.order_subsets import order_subsets
-from tigre.utilities.init_multigrid import init_multigrid
-from tigre.utilities.Measure_Quality import Measure_Quality as MQ
-from tigre.utilities.im3Dnorm import im3DNORM
-from tigre.algorithms.single_pass_algorithms import FDK
-from _minTV import minTV
-from _AwminTV import AwminTV
-import time
 import copy
+import time
+
+import numpy as np
+from _AwminTV import AwminTV
+from _minTV import minTV
+from tigre.algorithms.single_pass_algorithms import FDK
+from tigre.utilities.Atb import Atb
+from tigre.utilities.Ax import Ax
+from tigre.utilities.im3Dnorm import im3DNORM
+from tigre.utilities.init_multigrid import init_multigrid
+from tigre.utilities.order_subsets import order_subsets
+from tigre.utilities.Measure_Quality import Measure_Quality as MQ
+from tigre.utilities.gpu import GpuIds
+
 """
 This module is where the umbrella class IterativeReconAlg is located
 which is the umbrella class to all the other algorithms apart from
@@ -19,6 +22,12 @@ the single pass type algorithms.
 """
 
 # coding: utf8
+
+
+if hasattr(time, "perf_counter"):
+    default_timer = time.perf_counter
+else:
+    default_timer = time.clock
 
 
 class IterativeReconAlg(object):
@@ -49,13 +58,13 @@ class IterativeReconAlg(object):
         Sets the value of the hyperparameter.
 
     :keyword lmbda_red: (np.float64)
-        Reduction of lambda every iteration
-        lambda=lambdared*lambda. Default is 0.99
+        Reduction of lmbda every iteration
+        lmbda=lmbda_red*lmbda. Default is 0.99
 
     :keyword init: (str)
         Describes different initialization techniques.
                None      : Initializes the image to zeros (default)
-              "FDK"      : intializes image to FDK reconstrucition
+              "FDK"      : initializes image to FDK reconstruction
 
     :keyword verbose:  (Boolean)
         Feedback print statements for algorithm progress
@@ -65,7 +74,7 @@ class IterativeReconAlg(object):
         Chooses the subset ordering strategy. Options are:
                  "ordered"        : uses them in the input order, but
                                     divided
-                 "random"         : orders them randomply
+                 "random"         : orders them randomly
 
     :keyword tviter: (int)
         For algorithms that make use of a tvdenoising step in their
@@ -116,8 +125,7 @@ class IterativeReconAlg(object):
     --------------------------------------------------------------------
     Coded by:          MATLAB (original code): Ander Biguri
                        PYTHON : Reuben Lindroos
-
-     """
+    """
 
     def __init__(self, proj, geo, angles, niter, **kwargs):
 
@@ -126,48 +134,79 @@ class IterativeReconAlg(object):
         self.geo = geo
         self.niter = niter
 
-        options = dict(blocksize=20, lmbda=1, lmbda_red=0.99,
-                       OrderStrategy=None, Quameasopts=None,
-                       init=None, verbose=True, noneg=True,
-                       computel2=False, dataminimizing='art_data_minimizing',
-                       name='Iterative Reconstruction', sup_kw_warning=False)
+        self.geo.check_geo(angles)
+
+        options = dict(
+            blocksize=20,
+            lmbda=1,
+            lmbda_red=1,
+            OrderStrategy=None,
+            Quameasopts=None,
+            init=None,
+            verbose=True,
+            noneg=True,
+            computel2=False,
+            dataminimizing="art_data_minimizing",
+            name="Iterative Reconstruction",
+            sup_kw_warning=False,
+            gpuids=None,
+            niter_outer=4,
+            restart=True
+        )
         allowed_keywords = [
-            'V',
-            'W',
-            'log_parameters',
-            'angleblocks',
-            'angle_index',
-            'delta',
-            'regularisation',
-            'tviter',
-            'tvlambda',
-            'hyper']
+            "V",
+            "W",
+            "log_parameters",
+            "angleblocks",
+            "angle_index",
+            "alpha",
+            "alpha_red",
+            "rmax",
+            "maxl2err",
+            "delta",
+            "regularization",
+            "tviter",
+            "tvlambda",
+            "hyper",
+            "fista_p",
+            "fista_q",
+            "niter_outer"
+        ]
         self.__dict__.update(options)
         self.__dict__.update(**kwargs)
         for kw in kwargs.keys():
             if kw not in options and (kw not in allowed_keywords):
                 if self.verbose:
-                    if not kwargs.get('sup_kw_warning'):
+                    if not kwargs.get("sup_kw_warning"):
                         # Note: might not want this warning (typo checking).
                         print(
-                            "Warning: " +
-                            kw +
-                            " not recognised as default parameter for instance of IterativeReconAlg.")
+                            "Warning: "
+                            + kw
+                            + " not recognized as default parameter for instance of IterativeReconAlg."  # noqa: E501
+                        )
         if self.angles.ndim == 1:
             a1 = self.angles
             a2 = np.zeros(self.angles.shape[0], dtype=np.float32)
-            setattr(self, 'angles', np.vstack((a1, a2, a2)).T)
-        if not all([hasattr(self, 'angleindex'),
-                    hasattr(self, 'angleblocks')]):
+            self.angles = np.vstack((a1, a2, a2)).T
+        if not all([hasattr(self, "angleindex"), hasattr(self, "angleblocks")]):
             self.set_angle_index()
-        if not hasattr(self, 'W'):
+        if not hasattr(self, "W"):
             self.set_w()
-        if not hasattr(self, 'V'):
+        if not hasattr(self, "V"):
             self.set_v()
-        if not hasattr(self, 'res'):
+        if not hasattr(self, "res"):
             self.set_res()
-        setattr(self, 'lq', [])  # quameasoptslist
-        setattr(self, 'l2l', [])  # l2list
+        if self.verbose:
+            self.tic = 0    # preparation for _estimate_time_until_completion()
+        # make it list
+        if self.Quameasopts is not None:
+            self.Quameasopts = (
+                [self.Quameasopts] if isinstance(self.Quameasopts, str) else self.Quameasopts
+            )
+            setattr(self, "lq", np.zeros([len(self.Quameasopts), niter]))  # quameasoptslist
+        else:
+            setattr(self, "lq", np.zeros([0, niter]))  # quameasoptslist
+        setattr(self, "l2l", np.zeros([1, niter]))  # l2list
 
     def set_w(self):
         """
@@ -175,99 +214,94 @@ class IterativeReconAlg(object):
         :return: None
         """
         geox = copy.deepcopy(self.geo)
-        geox.sVoxel[0:] = self.geo.DSD - self.geo.DSO
-        geox.sVoxel[2] = max(geox.sDetector[1], geox.sVoxel[2])
+        geox.sVoxel[1:] = geox.sVoxel[1:] * 1.1  # a bit larger to avoid zeros in projections
+        geox.sVoxel[0] = max(geox.sDetector[0], geox.sVoxel[0])
+
         geox.nVoxel = np.array([2, 2, 2])
         geox.dVoxel = geox.sVoxel / geox.nVoxel
         W = Ax(
-            np.ones(
-                geox.nVoxel,
-                dtype=np.float32),
-            geox,
-            self.angles,
-            "ray-voxel")
-        W[W <= min(self.geo.dVoxel / 4)] = np.inf
-        W = 1. / W
-        setattr(self, 'W', W)
+            np.ones(geox.nVoxel, dtype=np.float32), geox, self.angles, "Siddon", gpuids=self.gpuids
+        )
+        W[W <= min(self.geo.dVoxel / 2)] = np.inf
+        W = 1.0 / W
+        setattr(self, "W", W)
 
     def set_v(self):
         """
         Computes value of V parameter if this is not given.
         :return: None
         """
+        block_count = len(self.angleblocks)
         geo = self.geo
-        if geo.mode != 'parallel':
+        V = np.ones((block_count, geo.nVoxel[1], geo.nVoxel[2]), dtype=np.float32)
 
-            start = geo.sVoxel[1] / 2 - geo.dVoxel[1] / 2 + geo.offOrigin[1]
-            stop = -geo.sVoxel[1] / 2 + geo.dVoxel[1] / 2 + geo.offOrigin[1]
-            step = -geo.dVoxel[1]
+        for i in range(block_count):
+            if geo.mode != "parallel":
 
-            xv = np.arange(start, stop + step, step)
+                geox = copy.deepcopy(self.geo)
+                geox.angles = self.angleblocks[i]
 
-            start = geo.sVoxel[2] / 2 - geo.dVoxel[2] / 2 + geo.offOrigin[2]
-            stop = -geo.sVoxel[2] / 2 + geo.dVoxel[2] / 2 + geo.offOrigin[2]
-            step = -geo.dVoxel[2]
+                geox.DSD = geo.DSD[self.angle_index[i]]
+                geox.DSO = geo.DSO[self.angle_index[i]]
+                geox.offOrigin = geo.offOrigin[self.angle_index[i], :]
+                geox.offDetector = geo.offDetector[self.angle_index[i], :]
+                geox.rotDetector = geo.rotDetector[self.angle_index[i], :]
+                geox.COR = geo.COR[self.angle_index[i]]
 
-            yv = -1 * np.arange(start, stop + step, step)
+                # shrink the volume size to avoid zeros in backprojection
+                geox.sVoxel = (
+                    geox.sVoxel * np.max(geox.sVoxel[1:] / np.linalg.norm(geox.sVoxel[1:])) * 0.9
+                )
+                geox.dVoxel = geox.sVoxel / geox.nVoxel
+                proj_one = np.ones(
+                    (len(self.angleblocks[i]), geo.nDetector[0], geo.nDetector[1]), dtype=np.float32
+                )
+                V[i] = Atb(proj_one, geox, self.angleblocks[i], "FDK", gpuids=self.gpuids).mean(
+                    axis=0
+                )
 
-            (yy, xx) = np.meshgrid(yv, xv)
-            A = (self.angles[:, 0] + np.pi / 2)
+            else:
+                V[i] *= len(self.angleblocks[i])
+        V[V==0.0] = np.inf       
 
-            V = np.empty((self.angles.shape[0], geo.nVoxel[1], geo.nVoxel[2]))
-            for i in range(self.angles.shape[0]):
-                if hasattr(geo.DSO, 'shape') and len(geo.DSO.shape) >= 1:
-                    DSO = geo.DSO[i]
-                else:
-                    DSO = geo.DSO
-                V[i] = (DSO / (DSO + (yy * np.sin(-A[i])) -
-                               (xx * np.cos(-A[i])))) ** 2
-
-        else:
-            V = np.ones((self.angles.shape[0]), dtype=np.float32)
-        if self.blocksize > 1:
-            v_list = [np.sum(V[self.angle_index[i]], axis=0)
-                      for i in range(len(self.angleblocks))]
-            V = np.stack(v_list, 0)
-
-        V = np.array(V, dtype=np.float32)
-        setattr(self, 'V', V)
+        self.V = V
 
     def set_res(self):
         """
-        Calulates initial value for res if this is not given.
+        Calculates initial value for res if this is not given.
         :return: None
         """
-        setattr(self, 'res', np.zeros(self.geo.nVoxel, dtype=np.float32))
+        self.res = np.zeros(self.geo.nVoxel, dtype=np.float32)
         init = self.init
         verbose = self.verbose
-        if init == 'multigrid':
-            if verbose:
-                print('init multigrid in progress...')
-                print('default blocksize=1 for init_multigrid(OS_SART)')
-            self.res = init_multigrid(
-                self.proj, self.geo, self.angles, alg='SART')
-            if verbose:
-                print('init multigrid complete.')
-        if init == 'FDK':
-            self.res = FDK(self.proj, self.geo, self.angles)
+        if isinstance(init, str):
+            if init == "multigrid":
+                if verbose:
+                    print("init multigrid in progress...")
+                    print("default blocksize=1 for init_multigrid(OS_SART)")
+                self.res = init_multigrid(self.proj, self.geo, self.angles, alg="SART")
+                if verbose:
+                    print("init multigrid complete.")
+            if init == "FDK":
+                self.res = np.maximum(FDK(self.proj, self.geo, self.angles),0)
 
-        if isinstance(init, np.ndarray):
+
+        elif isinstance(init, np.ndarray):
             if (self.geo.nVoxel == init.shape).all():
-
                 self.res = init
-
             else:
-                raise ValueError('wrong dimension of array for initialisation')
+                raise ValueError("wrong dimension of array for initialization")
+        elif init is not None:
+            raise ValueError("wrong value for initialization")
 
     def set_angle_index(self):
         """
         sets angle_index and angleblock if this is not given.
         :return: None
         """
-        angleblocks, angle_index = order_subsets(
-            self.angles, self.blocksize, self.OrderStrategy)
-        setattr(self, 'angleblocks', angleblocks)
-        setattr(self, 'angle_index', angle_index)
+        self.angleblocks, self.angle_index = order_subsets(
+            self.angles, self.blocksize, self.OrderStrategy
+        )
 
     def run_main_iter(self):
         """
@@ -282,66 +316,61 @@ class IterativeReconAlg(object):
             if Quameasopts is not None:
                 res_prev = copy.deepcopy(self.res)
             if self.verbose:
-                if i == 0:
-                    print(str(self.name).upper() +
-                          ' ' + "algorithm in progress.")
-                    toc = time.clock()
-                if i == 1:
-                    tic = time.clock()
-                    print('Esitmated time until completetion (s): ' +
-                          str((self.niter - 1) * (tic - toc)))
+                self._estimate_time_until_completion(i)
+
             getattr(self, self.dataminimizing)()
             self.error_measurement(res_prev, i)
 
     def art_data_minimizing(self):
-
         geo = copy.deepcopy(self.geo)
+
         for j in range(len(self.angleblocks)):
+
             if self.blocksize == 1:
                 angle = np.array([self.angleblocks[j]], dtype=np.float32)
+                angle_indices = np.array([self.angle_index[j]], dtype=np.int32)
+
             else:
                 angle = self.angleblocks[j]
-
-            if geo.offOrigin.shape[0] == self.angles.shape[0]:
-                geo.offOrigin = self.geo.offOrigin[j]
-            if geo.offDetector.shape[0] == self.angles.shape[0]:
-                geo.offOrin = self.geo.offDetector[j]
-            if geo.rotDetector.shape[0] == self.angles.shape[0]:
-                geo.rotDetector = self.geo.rotDetector[j]
-            if hasattr(geo.DSD, 'shape') and len((geo.DSD.shape)):
-                if geo.DSD.shape[0] == self.angles.shape[0]:
-                    geo.DSD = self.geo.DSD[j]
-            if hasattr(geo.DSO, 'shape') and len((geo.DSD.shape)):
-                if geo.DSO.shape[0] == self.angles.shape[0]:
-                    geo.DSO = self.geo.DSO[j]
+                angle_indices = self.angle_index[j]
+                # slice parameters if needed
+            geo.offOrigin = self.geo.offOrigin[angle_indices]
+            geo.offDetector = self.geo.offDetector[angle_indices]
+            geo.rotDetector = self.geo.rotDetector[angle_indices]
+            geo.DSD = self.geo.DSD[angle_indices]
+            geo.DSO = self.geo.DSO[angle_indices]
 
             self.update_image(geo, angle, j)
 
             if self.noneg:
                 self.res = self.res.clip(min=0)
 
-
     def minimizeTV(self, res_prev, dtvg):
-        return minTV(res_prev, dtvg, self.numiter_tv)
+        if self.gpuids is None:
+            self.gpuids = GpuIds()
+        return minTV(res_prev, dtvg, self.numiter_tv, self.gpuids)
 
     def minimizeAwTV(self, res_prev, dtvg):
-        return AwminTV(res_prev, dtvg, self.numiter_tv, self.delta)
+        if self.gpuids is None:
+            self.gpuids = GpuIds()
+        return AwminTV(res_prev, dtvg, self.numiter_tv, self.delta, self.gpuids)
 
     def error_measurement(self, res_prev, iter):
-        if self.Quameasopts is not None and iter > 0:
-            self.lq.append(MQ(self.res, res_prev, self.Quameasopts))
+        if self.Quameasopts is not None:
+            self.lq[:, iter] = MQ(self.res, res_prev, self.Quameasopts)
         if self.computel2:
             # compute l2 borm for b-Ax
             errornow = im3DNORM(
-                self.proj - Ax(self.res, self.geo, self.angles, 'ray-voxel'), 2)
-            self.l2l.append(errornow)
+                self.proj - Ax(self.res, self.geo, self.angles, "Siddon", gpuids=self.gpuids), 2
+            )
+            self.l2l[0, iter] = errornow
 
     def update_image(self, geo, angle, iteration):
         """
         VERBOSE:
          for j in range(angleblocks):
              angle = np.array([alpha[j]], dtype=np.float32)
-             proj_err = proj[angle_index[j]] - Ax(res, geo, angle, 'ray-voxel')
+             proj_err = proj[angle_index[j]] - Ax(res, geo, angle, 'Siddon')
              weighted_err = W[angle_index[j]] * proj_err
              backprj = Atb(weighted_err, geo, angle, 'FDK')
              weighted_backprj = 1 / V[angle_index[j]] * backprj
@@ -350,31 +379,61 @@ class IterativeReconAlg(object):
 
         :return: None
         """
-        self.res += self.lmbda * 1. / self.V[iteration] * Atb(self.W[self.angle_index[iteration]] * (
-            self.proj[self.angle_index[iteration]] - Ax(self.res, geo, angle, 'interpolated')), geo, angle, 'FDK')
+
+        ang_index = self.angle_index[iteration].astype(np.int32)
+
+        self.res += (
+            self.lmbda
+            * 1.0
+            / self.V[iteration]
+            * Atb(
+                self.W[ang_index]
+                * (self.proj[ang_index] - Ax(self.res, geo, angle, "Siddon", gpuids=self.gpuids)),
+                geo,
+                angle,
+                "FDK",
+                gpuids=self.gpuids,
+            )
+        )
 
     def getres(self):
         return self.res
 
     def geterrors(self):
-        return self.l2l, self.lq
+        if self.computel2:
+            return np.concatenate((self.l2l, self.lq), axis=0)
+        else:
+            return self.lq
 
     def __str__(self):
         parameters = []
         for item in self.__dict__:
-            if item == 'geo':
+            if item == "geo":
                 pass
-            elif hasattr(self.__dict__.get(item), 'shape'):
+            elif hasattr(self.__dict__.get(item), "shape"):
                 if self.__dict__.get(item).ravel().shape[0] > 100:
-                    parameters.append(item + ' shape: ' +
-                                      str(self.__dict__.get(item).shape))
+                    parameters.append(item + " shape: " + str(self.__dict__.get(item).shape))
             else:
-                parameters.append(item + ': ' + str(self.__dict__.get(item)))
+                parameters.append(item + ": " + str(self.__dict__.get(item)))
 
-        return '\n'.join(parameters)
+        return "\n".join(parameters)
+
+    def _estimate_time_until_completion(self, iter):
+        if iter == 0:
+            print(str(self.name).upper() + " " + "algorithm in progress.")
+            self.tic = default_timer()
+        if iter == 1:
+            toc = default_timer()
+
+            remaining_time = (self.niter - 1) * (toc - self.tic)
+            seconds = int(remaining_time)
+            print(
+                "Estimated time until completion : "
+                + time.strftime("%H:%M:%S", time.gmtime(seconds))
+            )
 
 
-def decorator(IterativeReconAlg, name=None, docstring=None):
+def decorator(IterativeReconAlg, name=None, docstring=None):  # noqa: N803
     """
     Calls run_main_iter when parameters are given to it.
 
@@ -390,7 +449,7 @@ def decorator(IterativeReconAlg, name=None, docstring=None):
     --------
     >>> import tigre
     >>> from tigre.demos.Test_data.data_loader import load_head_phantom
-    >>> geo = tigre.geometry_defaut(high_quality=False)
+    >>> geo = tigre.geometry_default(high_resolution=False)
     >>> src = load_head_phantom(number_of_voxels=geo.nVoxel)
     >>> proj = Ax(src,geo,angles)
     >>> angles = np.linspace(0,2*np.pi,100)
@@ -400,25 +459,24 @@ def decorator(IterativeReconAlg, name=None, docstring=None):
     """
 
     def iterativereconalg(proj, geo, angles, niter, **kwargs):
+
+        geo.check_geo(angles)
         alg = IterativeReconAlg(proj, geo, angles, niter, **kwargs)
         if name is not None:
             alg.name = name
         alg.run_main_iter()
-        if alg.computel2:
+        if alg.computel2 or alg.Quameasopts is not None:
             return alg.getres(), alg.geterrors()
         else:
             return alg.getres()
 
     if docstring is not None:
-        setattr(
-            iterativereconalg,
-            '__doc__',
-            docstring +
-            IterativeReconAlg.__doc__)
+        iterativereconalg.__doc__ = docstring + IterativeReconAlg.__doc__
     else:
-        setattr(iterativereconalg, '__doc__', IterativeReconAlg.__doc__)
+        iterativereconalg.__doc__ = IterativeReconAlg.__doc__
     if name is not None:
-        setattr(iterativereconalg, '__name__', name)
+        iterativereconalg.__name__ = name
+
     return iterativereconalg
 
 

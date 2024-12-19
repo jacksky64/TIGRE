@@ -1,24 +1,56 @@
-function V=computeV(geo,angles,alphablocks,orig_index)
-
+function V=computeV(geo,angles,alphablocks,orig_index,varargin)
+if nargin>=6
+    [gpuids] = parse_inputs(varargin{1:length(varargin)});
+elseif nargin==4
+    gpuids = GpuIds();
+else
+    error('Wrong amount of inputs, 4 or 6 expected');
+end
+    
 V=zeros(geo.nVoxel(1),geo.nVoxel(2) ,length(alphablocks),'single');
-% V2=zeros(geo.nVoxel(1),geo.nVoxel(2) ,length(alphablocks),'single');
+%geo.offDetector(1) = geo.offDetector(1) + (geo.DSD(1) / geo.DSO(1)) * geo.COR(1);  
 geo=checkGeo(geo,angles);
 
 if ~isfield(geo,'mode')||~strcmp(geo.mode,'parallel')
     for ii=1:length(alphablocks)
-        [x,y]=meshgrid(geo.sVoxel(1)/2-geo.dVoxel(1)/2+geo.offOrigin(1):-geo.dVoxel(1):-geo.sVoxel(1)/2+geo.dVoxel(1)/2+geo.offOrigin(1),...
-            -geo.sVoxel(2)/2+geo.dVoxel(2)/2+geo.offOrigin(2): geo.dVoxel(2): geo.sVoxel(2)/2-geo.dVoxel(2)/2+geo.offOrigin(2));
         auxang=alphablocks{ii};
         auxindex=orig_index{ii};
-%         A = permute(auxang(1,:)+pi/2, [1 3 2]);
-        for jj=1:length(auxang(1,:))
-            V(:,:,ii)=V(:,:,ii)+single(((geo.DSO(auxindex(jj)) ./ (geo.DSO(auxindex(jj)) +  y.*sin(-auxang(1,jj)-pi/2) -  x.*cos(-auxang(1,jj)-pi/2))).^2).');
-        end
-%         V(:,:,ii)= sum(permute(single((geo.DSO ./ (geo.DSO +  y.*sin(-A) -  x.*cos(-A))).^2),[2 1 3]),3);
+        auxgeo = geo;
+        % expand the detector to avoiding zeros in backprojection
+        maxsize=max(auxgeo.sVoxel+geo.offOrigin(:,auxindex),[],2);
+        auxgeo.sDetector=max(auxgeo.sDetector , [maxsize(1); maxsize(3)] *geo.DSD/geo.DSO);
+        auxgeo.dDetector = auxgeo.sDetector ./ auxgeo.nDetector;
+        % subset of projection angles
+        auxgeo.DSD = geo.DSD(auxindex);
+        auxgeo.DSO = geo.DSO(auxindex);
+        auxgeo.offOrigin = geo.offOrigin(:,auxindex);
+        auxgeo.offDetector = geo.offDetector(:,auxindex);
+        auxgeo.rotDetector = geo.rotDetector(:,auxindex);
+        auxgeo.COR = geo.COR(auxindex);
+        %auxgeo=geo;
+        V(:,:,ii) = mean(Atb(ones(geo.nDetector(2),geo.nDetector(1),size(auxang,2),'single'),auxgeo,auxang,'gpuids',gpuids),3)+0.000001;
     end
+    V(V==0.0)=Inf;
 else
     for ii=1:length(alphablocks)
         V(:,:,ii)=ones(geo.nVoxel(1:2).','single')*length(alphablocks{ii});
     end
 end
 end
+
+function [gpuids]=parse_inputs(varargin)
+    %fprintf('parse_inputs0(varargin (%d))\n', length(varargin));
+    if isempty(varargin)
+        gpuids = GpuIds();
+    else
+        % create input parser
+        p=inputParser;
+        % add optional parameters
+        addParameter(p,'gpuids', GpuIds());
+        %execute
+        parse(p,varargin{:});
+        %extract
+        gpuids=p.Results.gpuids;
+    end
+end
+

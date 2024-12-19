@@ -1,19 +1,20 @@
 from __future__ import division
+
+import copy
+
 import numpy as np
 import tigre
 from tigre.algorithms.iterative_recon_alg import IterativeReconAlg
 from tigre.algorithms.iterative_recon_alg import decorator
-import time
 from tigre.utilities.im_3d_denoise import im3ddenoise
-from tigre.algorithms.single_pass_algorithms import FDK
-import copy
+
 
 
 class FISTA(IterativeReconAlg):
     """
     Solves the reconstruction problem
     using the projection data PROJ taken over ALPHA angles, correspond-
-    ing to the geometry descrived in GEO, using NITER iterations.
+    ing to the geometry described in GEO, using NITER iterations.
 
     Parameters
     ----------
@@ -45,7 +46,8 @@ class FISTA(IterativeReconAlg):
     :keyword init: (str)
         Describes different initialization techniques.
               "none"     : Initializes the image to zeros (default)
-              "FDK"      : intializes image to FDK reconstrucition
+              "FDK"      : initializes image to FDK reconstruction
+              
     :keyword verbose:  (Boolean)
         Feedback print statements for algorithm progress
         default=True
@@ -62,7 +64,16 @@ class FISTA(IterativeReconAlg):
 
     :keyword tvlambda: (float)
         Multiplier for lambdaForTV which is proportional to L (hyper)
-        Default: 0.1
+        Default: 0.1      
+        
+    :keyword fista_p: (float)
+        Default: 1 for standard FISTA 
+        0.01 < fista_p <= 0.1 for faster FISTA
+        
+    :keyword fista_q: (float)
+        Default: 1 for standard FISTA 
+        0.0 < fista_q <= 1.0 for faster FISTA
+
     Usage
     --------
     >>> import numpy as np
@@ -97,47 +108,49 @@ class FISTA(IterativeReconAlg):
     Coded by:          MATLAB (original code): Ander Biguri
                        PYTHON : Reuben Lindroos
 
-     """
+    """
 
     def __init__(self, proj, geo, angles, niter, **kwargs):
-
-        # Dont precompute W and V
-        kwargs.update(dict(W=None,
-                           V=None,
-                           ))
+        # Don't precompute W and V
+        kwargs.update({"W": None, "V": None})
         kwargs.update(dict(blocksize=angles.shape[0]))
         IterativeReconAlg.__init__(self, proj, geo, angles, niter, **kwargs)
         self.lmbda = 0.1
-        if 'hyper' not in kwargs:
-            self.__L__ = 2.e4
-        else:
-            self.__L__ = kwargs['hyper']
-        if 'tviter' not in kwargs:
-            self.__numiter_tv__ = 20
-        else:
-            self.__numiter_tv__ = kwargs['tviter']
-        if 'tvlambda' not in kwargs:
-            self.__lambda__ = 0.1
-        else:
-            self.__lambda__ = kwargs['tvlambda']
+        self.__L__ = 2.0e8 if "hyper" not in kwargs else kwargs["hyper"]
+        self.__numiter_tv__ = 20 if "tviter" not in kwargs else kwargs["tviter"]
+        self.__lambda__ = 0.1 if "tvlambda" not in kwargs else kwargs["tvlambda"]
         self.__t__ = 1
-        self.__bm__ = 1. / self.__L__
+        self.__bm__ = 1.0 / self.__L__
+        self.__p__ = 1 if "fista_p" not in kwargs else kwargs["fista_p"]
+        self.__q__ = 1 if "fista_q" not in kwargs else kwargs["fista_q"]
 
-    # overide update_image from iterative recon alg to remove W.
+    # override update_image from iterative recon alg to remove W.
     def update_image(self, geo, angle, iteration):
         """
         VERBOSE:
          for j in range(angleblocks):
              angle = np.array([alpha[j]], dtype=np.float32)
-             proj_err = proj[angle_index[j]] - Ax(res, geo, angle, 'ray-voxel')
+             proj_err = proj[angle_index[j]] - Ax(res, geo, angle, 'Siddon')
              backprj = Atb(proj_err, geo, angle, 'FDK')
              res += backprj
              res[res<0]=0
 
         :return: None
         """
-        self.res += self.__bm__ * 2 * tigre.Atb((self.proj[self.angle_index[iteration]] - tigre.Ax(
-            self.res, geo, angle, 'interpolated')), geo, angle, 'matched')
+        self.res += (
+            self.__bm__
+            * 2
+            * tigre.Atb(
+                (
+                    self.proj[self.angle_index[iteration]]
+                    - tigre.Ax(self.res, geo, angle, "interpolated", gpuids=self.gpuids)
+                ),
+                geo,
+                angle,
+                "matched",
+                gpuids=self.gpuids,
+            )
+        )
 
     def run_main_iter(self):
         """
@@ -150,36 +163,29 @@ class FISTA(IterativeReconAlg):
         lambdaForTv = 2 * self.__bm__ * self.__lambda__
         for i in range(self.niter):
 
-            res_prev = None
-            if Quameasopts is not None:
-                res_prev = copy.deepcopy(self.res)
+            res_prev = copy.deepcopy(self.res) if Quameasopts is not None else None
             if self.verbose:
-                if i == 0:
-                    print(str(self.name).upper() +
-                          ' ' + "algorithm in progress.")
-                    toc = time.clock()
-                if i == 1:
-                    tic = time.clock()
-                    print('Esitmated time until completetion (s): ' +
-                          str((self.niter - 1) * (tic - toc)))
+                self._estimate_time_until_completion(i)
+
             getattr(self, self.dataminimizing)()
 
             x_rec_old = copy.deepcopy(x_rec)
-            x_rec = im3ddenoise(self.res, self.__numiter_tv__, 1. / lambdaForTv)
+            x_rec = im3ddenoise(self.res, self.__numiter_tv__, 1.0 / lambdaForTv, self.gpuids)
             t_old = t
-            t = (1 + np.sqrt(1 + 4 * t ** 2)) / 2
+            t = (self.__p__ + np.sqrt(self.__q__ + 4 * t ** 2)) / 2
             self.res = x_rec + (t_old - 1) / t * (x_rec - x_rec_old)
-
-            self.error_measurement(res_prev, i)
-
-
-fista = decorator(FISTA, name='FISTA')
+            
+            if Quameasopts is not None:
+                self.error_measurement(res_prev, i)
 
 
-class ISTA(FISTA):
+fista = decorator(FISTA, name="FISTA")
+
+
+class ISTA(FISTA):  # noqa: D101
     __doc__ = FISTA.__doc__
 
-    def __int__(self, proj, geo, angles, niter, **kwargs):
+    def __init__(self, proj, geo, angles, niter, **kwargs):
         FISTA.__init__(self, proj, geo, angles, niter, **kwargs)
 
     def run_main_iter(self):
@@ -191,23 +197,16 @@ class ISTA(FISTA):
         lambdaForTv = 2 * self.__bm__ * self.lmbda
         for i in range(self.niter):
 
-            res_prev = None
-            if Quameasopts is not None:
-                res_prev = copy.deepcopy(self.res)
+            res_prev = copy.deepcopy(self.res) if Quameasopts is not None else None
             if self.verbose:
-                if i == 0:
-                    print(str(self.name).upper() +
-                          ' ' + "algorithm in progress.")
-                    toc = time.clock()
-                if i == 1:
-                    tic = time.clock()
-                    print('Esitmated time until completetion (s): ' +
-                          str((self.niter - 1) * (tic - toc)))
+                self._estimate_time_until_completion(i)
+
             getattr(self, self.dataminimizing)()
 
-            self.res = im3ddenoise(self.res, 20, 1. / lambdaForTv)
+            self.res = im3ddenoise(self.res, 20, 1.0 / lambdaForTv, self.gpuids)
+            
+            if Quameasopts is not None:
+                self.error_measurement(res_prev, i)
 
-            self.error_measurement(res_prev, i)
 
-
-ista = decorator(ISTA, name='ISTA')
+ista = decorator(ISTA, name="ISTA")

@@ -2,7 +2,7 @@
 %
 %
 %
-% Some modenr CT geometires are starting to be a bit more complex, one of
+% Some modern CT geometries are starting to be a bit more complex, one of
 % the common things being arbitrary axis of rotation i.e. the detector and the
 % source can move not in a circular path, but in a "spherical" path. 
 %
@@ -63,12 +63,9 @@ geo.mode='cone';
 numProjs = 100;
 
 anglesY=linspace(0,2*pi,numProjs);
-%anglesZ2=anglesY;
-anglesZ1 = ones(1,numProjs)*0.0001;
-
-%anglesZ2(1,1:numProjs)=0;
-%anglesZ1=pi*sin(linspace(0,2*pi,numProjs));
-angles=[anglesY,anglesZ1,anglesZ1];
+anglesZ2=anglesY;
+anglesZ1=pi*sin(linspace(0,2*pi,numProjs));
+angles=[anglesZ1;anglesY;anglesZ2];
 %% Get Image
 
 head=headPhantom(geo.nVoxel);
@@ -83,6 +80,6 @@ plotProj(projections,(1:100)*pi/180); % angle information not right in the title
 % Note, FDK will not work.
 
 imgSIRT = SIRT(projections,geo, angles,50);
-imgCGLS=CGLS(projections,geo, angles,10);
+imgCGLS = CGLS(projections,geo, angles,10);
 
 plotImg([head imgCGLS imgSIRT] ,'dim',3)
